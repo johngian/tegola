@@ -35,6 +35,7 @@ type Provider struct {
 const (
 	// We quote the field and table names to prevent colliding with postgres keywords.
 	stdSQL = `SELECT %[1]v FROM %[2]v WHERE "%[3]v" && ` + bboxToken
+	mvtSQL = `SELECT %[1]v FROM %[2]v`
 
 	// SQL to get the column names, without hitting the information_schema. Though it might be better to hit the information_schema.
 	fldsSQL = `SELECT * FROM %[1]v LIMIT 0;`
@@ -50,25 +51,26 @@ const (
 )
 
 const (
-	ConfigKeyHost        = "host"
-	ConfigKeyPort        = "port"
-	ConfigKeyDB          = "database"
-	ConfigKeyUser        = "user"
-	ConfigKeyPassword    = "password"
-	ConfigKeySSLMode     = "ssl_mode"
-	ConfigKeySSLKey      = "ssl_key"
-	ConfigKeySSLCert     = "ssl_cert"
-	ConfigKeySSLRootCert = "ssl_root_cert"
-	ConfigKeyMaxConn     = "max_connections"
-	ConfigKeySRID        = "srid"
-	ConfigKeyLayers      = "layers"
-	ConfigKeyLayerName   = "name"
-	ConfigKeyTablename   = "tablename"
-	ConfigKeySQL         = "sql"
-	ConfigKeyFields      = "fields"
-	ConfigKeyGeomField   = "geometry_fieldname"
-	ConfigKeyGeomIDField = "id_fieldname"
-	ConfigKeyGeomType    = "geometry_type"
+	ConfigKeyHost         = "host"
+	ConfigKeyPort         = "port"
+	ConfigKeyDB           = "database"
+	ConfigKeyUser         = "user"
+	ConfigKeyPassword     = "password"
+	ConfigKeySSLMode      = "ssl_mode"
+	ConfigKeySSLKey       = "ssl_key"
+	ConfigKeySSLCert      = "ssl_cert"
+	ConfigKeySSLRootCert  = "ssl_root_cert"
+	ConfigKeyMaxConn      = "max_connections"
+	ConfigKeySRID         = "srid"
+	ConfigKeyLayers       = "layers"
+	ConfigKeyLayerName    = "name"
+	ConfigKeyTablename    = "tablename"
+	ConfigKeySQL          = "sql"
+	ConfigKeyFields       = "fields"
+	ConfigKeyGeomField    = "geometry_fieldname"
+	ConfigKeyGeomIDField  = "id_fieldname"
+	ConfigKeyGeomType     = "geometry_type"
+	ConfigKeyProviderType = "type"
 )
 
 // isSelectQuery is a regexp to check if a query starts with `SELECT`,
@@ -101,6 +103,11 @@ var isSelectQuery = regexp.MustCompile(`(?i)^((\s*)(--.*\n)?)*select`)
 // 			!ZOOM! - [Optional] will be replaced with the "Z" (zoom) value of the requested tile.
 //
 func CreateProvider(config dict.Dicter) (*Provider, error) {
+
+	providerType, err := config.String(ConfigKeyProviderType, nil)
+	if err != nil {
+		return nil, err
+	}
 
 	host, err := config.String(ConfigKeyHost, nil)
 	if err != nil {
@@ -297,7 +304,7 @@ func CreateProvider(config dict.Dicter) (*Provider, error) {
 			// Tablename and Fields will be used to build the query.
 			// We need to do some work. We need to check to see Fields contains the geom and gid fields
 			// and if not add them to the list. If Fields list is empty/nil we will use '*' for the field list.
-			l.sql, err = genSQL(&l, p.pool, tblName, fields, true)
+			l.sql, err = genSQL(&l, p.pool, tblName, fields, true, providerType)
 			if err != nil {
 				return nil, fmt.Errorf("could not generate sql, for layer(%v): %v", lname, err)
 			}
@@ -420,8 +427,14 @@ func (p Provider) inspectLayerGeomType(l *Layer) error {
 	// https://github.com/go-spatial/tegola/issues/180
 	//
 	// case insensitive search
+
 	re := regexp.MustCompile(`(?i)ST_AsBinary`)
 	sql := re.ReplaceAllString(l.sql, "ST_GeometryType")
+
+	re = regexp.MustCompile(`(?i)(ST_AsMVTGeom\(.*\))`)
+	if re.MatchString(sql) {
+		sql = fmt.Sprintf("SELECT ST_GeometryType(%v) FROM (%v) as q", l.geomField, sql)
+	}
 
 	// we only need a single result set to sniff out the geometry type
 	sql = fmt.Sprintf("%v LIMIT 1", sql)
@@ -638,12 +651,21 @@ func (p Provider) MVTForLayers(ctx context.Context, tile provider.Tile, layers [
 
 		// ref: https://postgis.net/docs/ST_AsMVT.html
 		// bytea ST_AsMVT(anyelement row, text name, integer extent, text geom_name, text feature_id_name)
+
+		var featureIDName string
+
+		if l.IDFieldName() == "" {
+			featureIDName = "NULL"
+		} else {
+			featureIDName = fmt.Sprintf(`'%s'`, l.IDFieldName())
+		}
+
 		sqls = append(sqls, fmt.Sprintf(
-			`(SELECT ST_AsMVT(q,'%s',%d,'%s','%s') AS data FROM (%s) AS q)`,
+			`(SELECT ST_AsMVT(q,'%s',%d,'%s',%s) AS data FROM (%s) AS q)`,
 			layers[i].MVTName,
 			tegola.DefaultExtent,
 			l.GeomFieldName(),
-			l.IDFieldName(),
+			featureIDName,
 			sql,
 		))
 	}
